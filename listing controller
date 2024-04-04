@@ -1,0 +1,172 @@
+import math
+import numpy as np
+import tensorflow as tf
+from controller import Supervisor
+#import os
+#os.environ['TF_CPP_MIN_LOG_LEVEL'] = "2"
+
+supervisor = Supervisor()
+total_reward = 0
+
+robot_node = supervisor.getFromDef("rosbot")
+if robot_node is None:
+    raise RuntimeError("Не удается найти узел робота в сцене.")
+
+front_left_motor = supervisor.getDevice("fl_wheel_joint")
+front_right_motor = supervisor.getDevice("fr_wheel_joint")
+rear_left_motor = supervisor.getDevice("rl_wheel_joint")
+rear_right_motor = supervisor.getDevice("rr_wheel_joint")
+
+front_left_motor.setPosition(float('inf'))
+front_right_motor.setPosition(float('inf'))
+rear_left_motor.setPosition(float('inf'))
+rear_right_motor.setPosition(float('inf'))
+
+base_speed = 10.0
+front_left_motor.setVelocity(base_speed)
+front_right_motor.setVelocity(base_speed)
+rear_left_motor.setVelocity(base_speed)
+rear_right_motor.setVelocity(base_speed)
+
+camera_rgb = supervisor.getDevice("camera rgb")
+camera_depth = supervisor.getDevice("camera depth")
+camera_depth.enable(32)
+camera_rgb.enable(32)
+
+num_actions = 3  
+state_size = 1  
+initial_position = robot_node.getField("translation").getSFVec3f()
+
+model = tf.keras.Sequential([
+    tf.keras.layers.Input(shape=(state_size,)),
+    tf.keras.layers.Dense(64, activation='leaky_relu'),
+    tf.keras.layers.Dense(num_actions, activation='linear')
+])
+
+optimizer = tf.keras.optimizers.Adam(learning_rate=0.3)
+loss_function = tf.keras.losses.MeanSquaredError()
+
+discount_factor = 0.9
+epsilon = 0.2
+
+# Функция для выбора действия на основе текущего состояния
+def choose_action(state):
+    if np.random.rand() < epsilon:
+        return np.random.randint(num_actions)
+    else:
+        q_values = model.predict(np.array([state]))
+        return np.argmax(q_values)
+        
+
+# Основной цикл управления роботом
+while supervisor.step(32) != -1:
+    
+    # Получение данных с камеры глубины
+    depth_image = camera_depth.getRangeImage()
+     
+    width = camera_depth.getWidth()
+    height = camera_depth.getHeight()
+
+    # Получение значения дистанции до всех пикселей вдоль ширины изображения
+    distances = []
+    
+    # Получение центрального пикселя изображения глубины
+    center_x = width // 2
+    center_y = height // 2
+    
+    for x in range(width):
+        distance = depth_image[x + center_y * width]
+        distances.append(distance)
+
+    # Получение значения дистанции до центрального пикселя
+    center_distance = distances[center_x]
+    
+    
+
+    # Получение состояния (расстояния до препятствия)
+    state = np.array([min(distances)])
+
+    # Выбор действия
+    action = choose_action(state)
+    
+    # Выполнение выбранного действия
+    if action == 0:
+        # Двигаться прямо
+        front_left_motor.setVelocity(base_speed)
+        front_right_motor.setVelocity(base_speed)
+        rear_left_motor.setVelocity(base_speed)
+        rear_right_motor.setVelocity(base_speed)
+        #if min(distances)<0.5:
+        #    reward = -1
+        #else:
+        reward = 7  # Награда за движение прямо
+    elif action == 1:
+        # Повернуть влево
+        front_left_motor.setVelocity(-base_speed)
+        front_right_motor.setVelocity(base_speed)
+        rear_left_motor.setVelocity(-base_speed)
+        rear_right_motor.setVelocity(base_speed)
+        #if min(distances)<0.5:
+        #    reward = 2
+        #else: 
+        reward = -0.5  # Маленькая отрицательная награда за поворот
+    else:
+        # Повернуть вправо
+        front_left_motor.setVelocity(base_speed)
+        front_right_motor.setVelocity(-base_speed)
+        rear_left_motor.setVelocity(base_speed)
+        rear_right_motor.setVelocity(-base_speed)
+        #if min(distances)<0.5:
+        #    reward = 2
+        #else: 
+        reward = -0.5
+          # Маленькая отрицательная награда за поворот
+
+    # Обработка награды (штрафа)
+    if min(distances) < 0.2:
+        reward += -300  # Большая отрицательная награда за столкновение
+        # СбDesktopComputerрос среды
+        supervisor.simulationReset()
+        supervisor.step(100)
+    
+    # Переинициализация параметров робота 
+        front_left_motor.setVelocity(base_speed)
+        front_right_motor.setVelocity(base_speed)
+        rear_left_motor.setVelocity(base_speed)
+        rear_right_motor.setVelocity(base_speed)
+        front_left_motor.setPosition(float('inf'))
+        front_right_motor.setPosition(float('inf'))
+        rear_left_motor.setPosition(float('inf'))
+        rear_right_motor.setPosition(float('inf'))
+        
+    total_reward += reward
+        
+
+    # Получение нового состояния 
+    new_distances = []
+    new_depth_image = camera_depth.getRangeImage()
+    for x in range(width):
+        distance = new_depth_image[x + center_y * width]
+        new_distances.append(distance)
+    new_center_distance = new_depth_image[len(new_depth_image) // 2]
+    new_state = np.array([min(new_distances)])
+
+    # Обновление Q-значения
+    q_values = model.predict(np.array([state]))
+    new_q_values = model.predict(np.array([new_state]))
+    max_q_value = np.max(new_q_values)
+    target = reward + discount_factor * max_q_value
+    q_values[0, action] = target
+    
+    
+
+    # Обучение нейронной сети на основе нового Q-значения
+    with tf.GradientTape() as tape:
+        predictions = model(np.array([state]))
+        loss = loss_function(q_values, predictions)
+    gradients = tape.gradient(loss, model.trainable_variables)
+    optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+    
+
+    # Вывод статистики
+    print('State:', state, 'Action:', action, 'Reward:', reward, 'Loss:', loss.numpy(),'TOTAL=', total_reward,'Q_values=', q_values  )
